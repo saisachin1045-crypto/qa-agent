@@ -99,13 +99,6 @@ Set `NEATLOGS_INGEST_URL` (or `--ingest-url`) to an HTTPS ingestion endpoint and
 
 This is a generic HTTP adapter: the correct NeatLogs endpoint, authentication, and payload contract must be confirmed against your account and adapted if necessary. Do not use the MCP URL as an ingestion endpoint. This adapter has not been verified against NeatLogs. Local trace storage remains the source of truth; NeatLogs retrieval/MCP is not implemented. Traces contain messages, model inputs, and order fixtures; use synthetic data for the demo.
 
-## Interview demonstration
-
-1. Run the faulty command; open `reports/faulty/qa_report.md`.
-2. Pick P3, then find the referenced span in the JSON to show the invalid action.
-3. Run the corrected command; compare the same suite with zero detected violations.
-4. Explain that the demo suite is scripted, while OpenAI mode generates scenarios dynamically.
-
 ## Limitations
 
 This is a prototype, not an exhaustive QA system. P5 checks the structured boolean and order ID, not consistency of free-text wording. Rules are only as complete as the encoded policy. No durable database, production authentication, concurrent execution, automatic retry policy, or real refund integration is included. OpenAI and NeatLogs live integrations need credentialed verification. Reports include execution errors so infrastructure failures are not presented as passing scenarios.
