@@ -1,0 +1,29 @@
+name: QA agent checks
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test policies, evidence gates, budgets, and mocked LLM tools
+        run: python -m unittest -v
+      - name: Run deliberately faulty agent
+        run: python qa_agent.py --faulty --output reports/faulty
+      - name: Run corrected agent
+        run: python qa_agent.py --output reports/fixed
+      - name: Save evidence and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-reports
+          path: reports/
