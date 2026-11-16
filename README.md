@@ -58,7 +58,7 @@ An LLM QA agent that reads a policy, invents customer scenarios, tests an LLM su
 - **Evidence gate:** a bug without valid span IDs from the referenced scenario is rejected. P1–P5 claims must match a deterministic violation. Other concerns use `OBSERVATION` and are marked `needs_review`; valid span IDs alone do not prove an interpretation correct.
 - **Budget cap:** at most 12 scenarios and 60 model turns shared across both LLMs. Limits can be lowered, not raised. Tools and reporting do not consume model turns.
 
-The QA agent has exactly four tools: `run_scenario`, `get_trace`, `check_rules`, and `file_bug`. The reporter does not automatically create bugs for the QA agent.
+The QA agent has exactly four tools: `run_scenario`, `get_trace`, `check_rules`, and `file_bug`. The reporter does not automatically create bugs for the QA agent. A persistent regression harness supplies historical failures to the planner without adding a fifth tool.
 
 ## Requirements
 
@@ -111,7 +111,7 @@ Open `reports/qa_report.md` for the summary and findings. `reports/qa_report.jso
 
 A `rule_confirmed` finding is backed by deterministic checks. A `needs_review` observation is the QA agent's interpretation of cited evidence. Invalid refund attempts are flagged even when the backend rejects them.
 
-Exit codes: **0** = completed and inspected run with no filed bugs; **1** = filed bugs; **2** = execution failure, no scenarios, incomplete/uninspected scenarios, or exhausted model-turn budget. A clean report is not proof of correctness.
+Exit codes: **0** = completed and inspected run with no filed bugs or unsuccessful selected regression checks; **1** = filed bugs or a failed regression; **2** = execution failure, no scenarios, incomplete/uninspected scenarios, exhausted model-turn budget, or selected regression work that is missing, stale, inconclusive, or awaiting review. A clean report is not proof of correctness.
 
 ## Sample policy and coverage
 
@@ -157,3 +157,45 @@ The GitHub Actions workflow runs tests on pushes and pull requests. Nightly at 0
 4. Download the `qa-reports` artifact for the Markdown and JSON reports.
 
 Without that secret, the live step is explicitly skipped and the workflow summary says so. Report upload runs even when bugs or execution failures cause a nonzero exit. Live OpenAI and NeatLogs integrations still require credentialed verification.
+
+## Regression harness: remember bugs and test for recurrence
+
+Every accepted bug becomes a persistent case in `.qa/regressions.json`. It stores the original customer message, order fixtures, rule/observation, evidence references, policy/checker fingerprint, and recent retest history. Identical rule + normalized message + fixtures + checker contract deduplicate into one case even when the LLM changes the title. Observations also use their title to distinguish different subjective concerns. Related but distinct scenarios remain separate cases when filed as bugs.
+
+Run the same command again to reuse history automatically:
+
+```sh
+python qa_agent.py
+# Or choose an explicit persistent location:
+python qa_agent.py --history .qa/regressions.json --output reports
+```
+
+On subsequent runs:
+
+1. The planner receives selected historical cases, their status, and previous outcomes, including resolved cases.
+2. It calls `run_scenario` with `regression_id` for exact replays. The harness enforces the stored message and fixture snapshot; the LLM cannot substitute an easier case.
+3. It reads each trace and runs deterministic checks. Exploratory scenarios are blocked while selected exact replays remain unchecked.
+4. It invents related scenarios with `related_to`: changed wording, adversarial instructions, or nearby boundaries. These are independently reported and cannot resolve the original case.
+5. It files new bugs with span evidence. New cases become available for the next run.
+
+The four-tool interface and the 12-scenario / 60-model-turn limits remain in force. The harness selects at most half the scenario budget for historical cases (at least one when history exists), reserving room for related tests. Least recently tested cases go first, so older resolved cases rotate back in. The report lists deferred cases, cases not retested, and missing related tests; it never calls those passed. The shared model budget can stop execution before the selected suite finishes.
+
+### Outcome meanings
+
+| Current result | Meaning |
+| --- | --- |
+| `failed` | The same deterministic rule violation recurred, with current span evidence. An original case previously resolved becomes `reopened`. |
+| `passed` | The completed run exercised the original target orders, produced a final answer, and did not violate the saved rule. An exact case becomes `resolved` for this regression check. |
+| `inconclusive` | The run was incomplete or did not exercise enough relevant actions to establish a pass. |
+| `needs_review` | A historical subjective observation needs human judgment; absence of an LLM complaint cannot automatically resolve it. |
+| `stale` | The policy or deterministic checker changed, so the old expected contract requires review. |
+
+`resolved` means the latest qualifying exact replay passed its saved rule; it is not a guarantee the underlying problem is eliminated. A related variation can still fail, and that failure makes the run unsuccessful even when the exact replay passes. There is no guarantee that testing prevents every future bug. Repeated `check_rules` calls within one run cannot manufacture a history of multiple passes. A failure takes precedence over a later pass in that same run.
+
+### History persistence in GitHub Actions
+
+Nightly/manual runs restore regression history from a branch-scoped GitHub Actions cache and save it even when bugs make the QA command fail. Live runs are serialized to avoid concurrent history updates. The `qa-reports` artifact includes `.qa/regressions.json` as a backup alongside reports; no history or credentials are committed to the repository.
+
+GitHub caches and artifacts have retention limits and can be deleted or evicted. Download the history artifact for a durable backup. If the cache is unavailable, restore that file locally and use `--history`; a missing history file starts an empty case store. Local users should keep `.qa/regressions.json` between runs and avoid concurrent processes writing the same file. An invalid history file causes an error rather than silently overwriting it.
+
+The regression lifecycle is covered by offline tests, including fail → pass → recurrence, evidence-based evaluation, incomplete/stale cases, planner replay and related-scenario generation, deduplication, and budget exhaustion. Live model behavior still needs credentialed validation.
