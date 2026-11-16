@@ -1,4 +1,4 @@
-name: QA agent checks
+name: QA agent
 on:
   push:
   pull_request:
@@ -8,22 +8,36 @@ on:
 permissions:
   contents: read
 jobs:
-  demo:
+  tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Test policies, evidence gates, budgets, and mocked LLM tools
-        run: python -m unittest -v
-      - name: Run deliberately faulty agent
-        run: python qa_agent.py --faulty --output reports/faulty
-      - name: Run corrected agent
-        run: python qa_agent.py --output reports/fixed
-      - name: Save evidence and reports
+      - run: python -m unittest -v
+  live-qa:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Explain missing credentials
+        if: env.OPENAI_API_KEY == ''
+        run: echo 'Live QA skipped — configure the OPENAI_API_KEY Actions secret to enable the LLM run.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Run QA agent
+        if: env.OPENAI_API_KEY != ''
+        run: python qa_agent.py --output reports
+      - name: Upload reports and traces
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: qa-reports
           path: reports/
+          if-no-files-found: ignore
