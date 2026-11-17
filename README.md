@@ -1,201 +1,139 @@
-# QA agent
+# QA for the NeatLogs diagnosis agent
 
-An LLM QA agent that reads a policy, invents customer scenarios, tests an LLM support agent, inspects execution traces, and files bugs with span evidence. The implementation lives in `qa_agent.py`.
+A QA agent tests whether **NeatLogs correctly analyzes website/AI-workflow telemetry, identifies a supported problem, and proposes an appropriate fix**. It evaluates the diagnosis and proposed fix against controlled telemetry evidence.
+
+The suite is based on the supplied Goal purse / GoalPulse detection definitions: tool and agent failures, hallucination, response constraints, repeated unresolved failures, prediction guardrails, and the distinction between neutral/positive monitoring and real problems.
+
+**Integration status:** the harness and offline tests are implemented. The actual NeatLogs diagnosis runner requires a deployment-specific adapter; no live NeatLogs connection has been verified. An explicitly selected reference LLM is available to exercise the harness. Its reports identify it as a reference, not the deployed NeatLogs agent.
 
 ## Architecture
 
 ```text
-                         ┌──────────────────────────────┐
-   deploy / nightly ───► │  QA AGENT  (LLM, tool loop)  │
-                         │  reads POLICY, plans tests   │
-                         └─────────────┬────────────────┘
-                                       │ calls 4 tools
-          ┌────────────────┬───────────┴───────────┬────────────────┐
-          ▼                ▼                       ▼                ▼
-     run_scenario      get_trace              check_rules       file_bug
-     (send a made-up   (read spans)           (exact code,       (rejected unless
-      customer msg)                            no AI)            span IDs exist)
-          │                ▲                       ▲                │
-          ▼                │                       │                ▼
-┌──────────────────────────┐                       │       ┌────────────────┐
-│ AGENT UNDER TEST (LLM)    │                       │       │ REPORT         │
-│ support agent            │                       │       │ qa_report.md   │
-│  ├─ lookup_order  (tool)  │                       │       │ qa_report.json │
-│  └─ refund_order  (tool)  │                       │       └────────────────┘
-└────────────┬─────────────┘                       │         ▲
-             │ every model turn and tool call      │         │ QA final summary
-             ▼                                     │
-     ┌─────────────────────────────────────────────┐
-     │ TRACE STORE                                 │ ──► NeatLogs
-     │ trace → spans: input, output, error,         │     (HTTP ingest, optional)
-     │ duration_ms                                 │
-     └─────────────────────────────────────────────┘
+Website / AI workflow
+  └─ OpenTelemetry traces, spans and ordered session evidence
+         │
+         ▼
+  NEATLOGS DIAGNOSIS AGENT (the agent under test)
+         └─ findings + evidence + proposed fix (no fix execution)
+
+QA AGENT (LLM planner)
+  ├─ run_scenario ── generate controlled OTel evidence ──► target adapter
+  ├─ get_trace   ◄── source telemetry + target result + execution spans
+  ├─ check_rules ─── deterministic P1–P5 checks against independent fixture oracle
+  └─ file_bug ────── real span evidence required
+         │
+         ├─ qa_report.md / qa_report.json
+         └─ persistent regression history → exact replay + related variants
 ```
 
-## The five parts
+The expected answers are held by QA and never sent to the diagnosis target. Synthetic traces provide known ground truth; the LLM selects scenario families and variations, inspects results, files findings and summarizes.
 
-| Part | In the code | Job |
+| Part | Code | Responsibility |
 | --- | --- | --- |
-| QA agent | `QASession.run()` | The brain. It invents scenarios, decides what to run next, and decides when to stop. |
-| Agent under test | `run_support_agent()` | The AI being tested, with its own `lookup_order` and `refund_order` tools. |
-| Trace store | `TRACES`, `add_span()`, `get_trace()` | Records every model turn and tool call. This is the storage boundary a NeatLogs-backed store can replace. |
-| Rule engine | `check_rules()` | Exact policy checks P1–P5, with no AI involved. |
-| Reporter | `file_bug()`, `write_report()` | Accepts bugs with real span evidence, then writes Markdown and JSON reports. |
+| QA planner | `QASession.run()` | LLM tool loop with exactly four tools. |
+| Agent under test | `run_neatlogs_agent()` + `targets.py` | Invokes the chosen diagnosis target and records output/errors. |
+| Test inputs | `scenarios.py` | Builds OTel-shaped fixtures and a separate expected-result oracle. |
+| Trace store | `TRACES`, `add_span()`, `get_trace()` | Records source evidence and QA/target execution. |
+| Rule engine | `check_rules()` | Evaluates structured diagnosis, evidence, scope, and proposed remedy. |
+| Reporter | `file_bug()`, `write_report()` | Produces evidence-backed findings and reports. |
+| Regression harness | `regression.py` | Remembers bugs and tracks exact-replay outcomes. |
 
-## One run, step by step
+## What is checked
 
-1. The QA agent reads `POLICY` and invents a customer message.
-2. `run_scenario` sends it to the support agent, which calls its tools and answers.
-3. Every step lands in `TRACES` as a span.
-4. The QA agent reads the trace using `get_trace` and runs `check_rules`.
-5. If a rule broke, or the trace shows something else wrong, it calls `file_bug` with supporting span IDs.
-6. It repeats until the configured policy coverage targets are reached, it decides to stop, or 12 scenarios are used. It can finish inspection and reporting after the scenario cap; a shared 60-model-turn cap stops all further LLM calls.
-7. `write_report()` writes the final summary, filed bugs, coverage, errors, and traces.
+| Rule | Check |
+| --- | --- |
+| P1 | Evidence references exist in the selected trace/session; no invented or unrelated span IDs. |
+| P2 | Detection identity, polarity, and scope fit the fixture; no missed known failure or false negative detection. |
+| P3 | The diagnosis includes decisive evidence, including both failed attempts for repeated failure; respects recovery and superseded constraints. |
+| P4 | The proposed remedy category fits the evidence; healthy and incomplete inputs do not get invented repairs. |
+| P5 | Assessment reflects the supported outcome; the agent does not claim to have applied a fix. |
 
-## Three guardrails
+An output can be technically valid yet fail a policy. Invalid/missing output, target errors and timeouts are marked incomplete instead of passing. The free-text explanation and proposed code correctness are not exhaustively checked by deterministic rules; the QA agent can file those concerns as `OBSERVATION` for review.
 
-- **Rules before opinion:** policy facts come from deterministic code; the LLM plans tests and explains findings.
-- **Evidence gate:** a bug without valid span IDs from the referenced scenario is rejected. P1–P5 claims must match a deterministic violation. Other concerns use `OBSERVATION` and are marked `needs_review`; valid span IDs alone do not prove an interpretation correct.
-- **Budget cap:** at most 12 scenarios and 60 model turns shared across both LLMs. Limits can be lowered, not raised. Tools and reporting do not consume model turns.
+## Scenario suite
 
-The QA agent has exactly four tools: `run_scenario`, `get_trace`, `check_rules`, and `file_bug`. The reporter does not automatically create bugs for the QA agent. A persistent regression harness supplies historical failures to the planner without adding a fifth tool.
+- **Neutral monitors:** fixture processing, forecast collection and comparison are not defects merely because they were detected.
+- **Workflow without LLM calls:** missing token usage does not establish a model failure or prove zero cost.
+- **Tool failure:** a forecast tool fails with HTTP 503 and no result.
+- **Agent error:** an AGENT span records an exception; it is a local failure, not automatically a whole-task verdict.
+- **Guardrail rejection:** correct safety rejection is neutral.
+- **Hallucination:** an answer contradicts a supplied final-score source.
+- **Response contract:** the response violates an explicit JSON-only requirement.
+- **Repeated unresolved failure:** the same goal fails, is retried, and still fails in the latest completed turn.
+- **Recovered retry:** later success excludes the unresolved-failure finding.
+- **Superseded constraint:** the user changes the format requirement; the new format is valid.
+- **Prediction guardrail:** an out-of-range probability explicitly fails validation.
+- **Missing evidence:** no input/output supports a definitive diagnosis; collect evidence.
 
-## Requirements
+Variants rename workflows, include an error from a different trace, or add adversarial instructions inside log data. These inputs are synthetic and are not exports of the user's 10,514 production traces. The dashboard's 63.5% detection rate is not a bug rate; the pasted 0%/100% Eval values lack enough context to assert correctness or failure.
 
-- Python 3.10 or newer.
-- An OpenAI API key with access to a model supporting Chat Completions tool calls.
-- No third-party Python packages.
+## Run offline checks
 
-## How to run
+Python 3.10+; standard library only.
 
 ```sh
 git clone https://github.com/saisachin1045-crypto/qa-agent.git
 cd qa-agent
-```
-
-### Windows PowerShell
-
-```powershell
-$env:OPENAI_API_KEY = "YOUR_API_KEY"
-python qa_agent.py
-```
-
-If `python` is unavailable, try `py qa_agent.py` after installing Python.
-
-### macOS / Linux
-
-```sh
-export OPENAI_API_KEY="YOUR_API_KEY"
-python3 qa_agent.py
-```
-
-The default command runs **both real LLM agents**. There is no scripted scenario mode. API calls incur charges. `.env.example` lists configuration variables; the program reads the process environment and does not automatically load `.env` files.
-
-### Options
-
-```sh
-python qa_agent.py --model gpt-4.1-mini --max-scenarios 12 --max-turns 60 --output reports
-```
-
-The QA planner chooses customer messages dynamically. Each scenario starts with fresh fictional order fixtures and authenticated customer `alice`. Refund tools operate on in-memory fixtures; they do not move real money. To test your own agent, replace `run_support_agent()` while preserving its trace instrumentation.
-
-## Reports
-
-Open `reports/qa_report.md` for the summary and findings. `reports/qa_report.json` contains:
-
-- The QA agent's final summary and stop reason.
-- Filed bugs with trace IDs, span IDs, and confirmation/review status.
-- Per-policy covered and missing targets.
-- Scenario traces and the QA agent's own model/tool trace.
-- Incomplete or uninspected runs and optional export warnings.
-
-A `rule_confirmed` finding is backed by deterministic checks. A `needs_review` observation is the QA agent's interpretation of cited evidence. Invalid refund attempts are flagged even when the backend rejects them.
-
-Exit codes: **0** = completed and inspected run with no filed bugs or unsuccessful selected regression checks; **1** = filed bugs or a failed regression; **2** = execution failure, no scenarios, incomplete/uninspected scenarios, exhausted model-turn budget, or selected regression work that is missing, stale, inconclusive, or awaiting review. A clean report is not proof of correctness.
-
-## Sample policy and coverage
-
-The architecture specifies policy IDs but not their business definitions. This implementation uses the following editable support/refund policy in `POLICY` and `check_rules()`:
-
-| Rule | Check | Coverage targets from completed, checked traces |
-| --- | --- | --- |
-| P1 | Look up the order before attempting a refund. | A refund attempt exercises lookup ordering. |
-| P2 | Refund only the authenticated customer's orders. | Look up both an owned and a foreign order. |
-| P3 | Refund only orders delivered 0–30 days ago, inclusive. | Inspect within-window, day-30, expired, and undelivered fixtures. |
-| P4 | Positive amount, at most the amount paid, no duplicate refund. | Exercise a valid amount and inspect an already-refunded order. |
-| P5 | Claim refund success only after a successful refund tool result. | Exercise both success and non-success final answers. |
-
-`COVERAGE_TARGETS` defines the finite stopping criteria. Coverage comes from real trace events evaluated by `check_rules`, not the planner's assertion. Once all targets are covered, `run_scenario` refuses further scenarios while the planner finishes inspection, bug filing, and its summary. These targets are not exhaustive branch or natural-language coverage. P5 checks the structured `refund_succeeded` field; inconsistent free-text wording can be raised by the QA agent as an observation.
-
-## Optional NeatLogs HTTP ingestion
-
-Set `NEATLOGS_INGEST_URL` to a provider-confirmed ingestion endpoint and optionally `NEATLOGS_API_KEY` for Bearer authentication:
-
-```powershell
-$env:NEATLOGS_INGEST_URL = "https://YOUR_VERIFIED_INGEST_ENDPOINT"
-$env:NEATLOGS_API_KEY = "YOUR_INGEST_KEY"
-python qa_agent.py
-```
-
-The adapter POSTs each completed or interrupted scenario trace as JSON. Its payload has `id`, `customer_id`, `message`, `orders`, `completed`, and `spans`; each span includes `id`, `trace_id`, `name`, `input`, `output`, `error`, and `duration_ms`. Confirm the endpoint, authentication and payload contract with NeatLogs and adapt `export_trace()` if required. The MCP URL is not an HTTP ingestion URL.
-
-This optional adapter has not been verified against a live NeatLogs account. Local `TRACES` remains the backing store; replacing it fully requires provider-backed writes and reads through the same storage functions. Export failures are recorded without discarding local reports.
-
-## Tests and nightly runs
-
-```sh
 python -m unittest -v
 ```
 
-Tests use mocked model responses to exercise the actual QA and support tool loops without API credentials. They cover all five rules, evidence gating, observations, coverage, budgets, partial runs, provider errors, backend behavior, and optional ingestion failure. Mocked tests are not live LLM validation.
+Tests use controlled target responses and a test-only oracle. They validate the harness, not the quality of a deployed NeatLogs agent.
 
-The GitHub Actions workflow runs tests on pushes and pull requests. Nightly at 02:00 UTC and on manual dispatch, it also runs the real QA agent when the repository's `OPENAI_API_KEY` Actions secret is configured:
+## Exercise the harness with a reference LLM
 
-1. Go to **Settings → Secrets and variables → Actions**.
-2. Add a repository secret named `OPENAI_API_KEY`.
-3. Go to **Actions → QA agent → Run workflow** to run immediately.
-4. Download the `qa-reports` artifact for the Markdown and JSON reports.
+PowerShell:
 
-Without that secret, the live step is explicitly skipped and the workflow summary says so. Report upload runs even when bugs or execution failures cause a nonzero exit. Live OpenAI and NeatLogs integrations still require credentialed verification.
-
-## Regression harness: remember bugs and test for recurrence
-
-Every accepted bug becomes a persistent case in `.qa/regressions.json`. It stores the original customer message, order fixtures, rule/observation, evidence references, policy/checker fingerprint, and recent retest history. Identical rule + normalized message + fixtures + checker contract deduplicate into one case even when the LLM changes the title. Observations also use their title to distinguish different subjective concerns. Related but distinct scenarios remain separate cases when filed as bugs.
-
-Run the same command again to reuse history automatically:
-
-```sh
-python qa_agent.py
-# Or choose an explicit persistent location:
-python qa_agent.py --history .qa/regressions.json --output reports
+```powershell
+$env:OPENAI_API_KEY = "YOUR_KEY"
+python qa_agent.py --target reference
 ```
 
-On subsequent runs:
+macOS/Linux:
 
-1. The planner receives selected historical cases, their status, and previous outcomes, including resolved cases.
-2. It calls `run_scenario` with `regression_id` for exact replays. The harness enforces the stored message and fixture snapshot; the LLM cannot substitute an easier case.
-3. It reads each trace and runs deterministic checks. Exploratory scenarios are blocked while selected exact replays remain unchecked.
-4. It invents related scenarios with `related_to`: changed wording, adversarial instructions, or nearby boundaries. These are independently reported and cannot resolve the original case.
-5. It files new bugs with span evidence. New cases become available for the next run.
+```sh
+export OPENAI_API_KEY="YOUR_KEY"
+python3 qa_agent.py --target reference
+```
 
-The four-tool interface and the 12-scenario / 60-model-turn limits remain in force. The harness selects at most half the scenario budget for historical cases (at least one when history exists), reserving room for related tests. Least recently tested cases go first, so older resolved cases rotate back in. The report lists deferred cases, cases not retested, and missing related tests; it never calls those passed. The shared model budget can stop execution before the selected suite finishes.
+This uses OpenAI for both the QA planner and a standalone diagnosis baseline. It incurs API charges and does not call NeatLogs. Select a tool-capable model with `--model`; the default is `gpt-4.1-mini`. `.env.example` is documentation; configuration is read from the process environment.
 
-### Outcome meanings
+## Test the actual NeatLogs agent
 
-| Current result | Meaning |
-| --- | --- |
-| `failed` | The same deterministic rule violation recurred, with current span evidence. An original case previously resolved becomes `reopened`. |
-| `passed` | The completed run exercised the original target orders, produced a final answer, and did not violate the saved rule. An exact case becomes `resolved` for this regression check. |
-| `inconclusive` | The run was incomplete or did not exercise enough relevant actions to establish a pass. |
-| `needs_review` | A historical subjective observation needs human judgment; absence of an LLM complaint cannot automatically resolve it. |
-| `stale` | The policy or deterministic checker changed, so the old expected contract requires review. |
+Implement the team-specific runner adapter described in **[docs/adapter-contract.md](docs/adapter-contract.md)**, then run:
 
-`resolved` means the latest qualifying exact replay passed its saved rule; it is not a guarantee the underlying problem is eliminated. A related variation can still fail, and that failure makes the run unsuccessful even when the exact replay passes. There is no guarantee that testing prevents every future bug. Repeated `check_rules` calls within one run cannot manufacture a history of multiple passes. A failure takes precedence over a later pass in that same run.
+```sh
+python qa_agent.py --target command --adapter-command '["python", "your_neatlogs_runner_adapter.py"]' --target-id neatlogs-staging-diagnosis
+```
 
-### History persistence in GitHub Actions
+The adapter receives telemetry on stdin and returns the real diagnosis in a normalized JSON format on stdout. It must wait for completed analysis and preserve evidence IDs. The harness does not invent a provider endpoint or silently replace the actual runner with the reference model.
 
-Nightly/manual runs restore regression history from a branch-scoped GitHub Actions cache and save it even when bugs make the QA command fail. Live runs are serialized to avoid concurrent history updates. The `qa-reports` artifact includes `.qa/regressions.json` as a backup alongside reports; no history or credentials are committed to the repository.
+## Reports and limits
 
-GitHub caches and artifacts have retention limits and can be deleted or evicted. Download the history artifact for a durable backup. If the cache is unavailable, restore that file locally and use `--history`; a missing history file starts an empty case store. Local users should keep `.qa/regressions.json` between runs and avoid concurrent processes writing the same file. An invalid history file causes an error rather than silently overwriting it.
+Open `reports/qa_report.md`; the JSON report includes the target identity, source fixtures, normalized diagnoses, evidence, checks, regression outcomes and execution errors. Use `--output` to change the folder.
 
-The regression lifecycle is covered by offline tests, including fail → pass → recurrence, evidence-based evaluation, incomplete/stale cases, planner replay and related-scenario generation, deduplication, and budget exhaustion. Live model behavior still needs credentialed validation.
+At most 12 scenarios and 60 harness model turns; lower these using `--max-scenarios` and `--max-turns`. Reference-mode calls share the counter. Internal model calls made by an external NeatLogs runner cannot be counted by this process; budget them in that runner. External target calls have a 90-second timeout.
+
+Coverage means a completed fixture family was exercised and checked, not that it passed or that all real-world behavior is covered. The model may stop early, with missing families listed. Bug filing requires valid IDs from the scenario. P1–P5 claims must match the rule engine; observations remain `needs_review`. The report preserves filed bugs, while CI also fails on deterministic violations the planner neglected to file.
+
+Exit codes: **0** = completed/inspected run without detected violations or unresolved selected regression work; **1** = bug/violation/failed regression; **2** = incomplete execution, exhausted turns, no scenarios, uninspected results, or stale/inconclusive/pending selected retests.
+
+## Regression memory
+
+Accepted bugs are saved to `.qa/regressions.json`. Later runs prioritize exact packet replays, then request another variation of the same scenario family. The stored packet and oracle are authoritative for an exact replay. Failure family, variant, rule, target identity and checker contract determine case identity, so random span IDs do not create duplicate cases.
+
+Outcomes are `failed`, `passed`, `inconclusive`, `stale`, or `needs_review`. A passing exact replay resolves that particular check; a recurrence reopens it. Related variants cannot resolve the original case. Observations do not resolve automatically. Repeat checks in the same run cannot manufacture multiple passing runs, and failure takes precedence. History rotates older cases first and reports deferred or untested cases. Keep a stable `--target-id` for successive versions of the same runner.
+
+Legacy support/refund history from earlier repository versions is preserved under `archived_legacy_cases` and is never replayed as diagnosis evidence. History with an unknown schema or corrupted JSON raises an error instead of being overwritten. Local writes are atomic; run one process per history file.
+
+## GitHub Actions
+
+Pushes and pull requests run offline tests. Nightly at 02:00 UTC (7:30 AM IST) and manual runs can test a configured NeatLogs runner:
+
+1. Add `OPENAI_API_KEY` as an Actions secret for the QA planner.
+2. Supply your adapter script in the checkout and set Actions variables `NEATLOGS_ADAPTER_COMMAND` (JSON argv array) and `NEATLOGS_TARGET_ID`.
+3. Add whatever credentials the adapter needs; the workflow exposes `NEATLOGS_API_KEY` if supplied as a secret.
+4. Open **Actions → NeatLogs diagnosis QA → Run workflow**, choosing `command`.
+
+Without an adapter/key, the workflow explicitly reports the target run as skipped. Manual `reference` runs are separately labeled; nightly execution never silently substitutes a baseline for NeatLogs. Download `qa-reports` for outputs and history.
+
+Runs are serialized and history is restored/saved using a branch-scoped Actions cache, even on detected bugs. Caches and artifacts have retention limits: download history for a durable backup. Use `--history PATH` locally to restore it. Reference and real target cases are isolated by target identity.

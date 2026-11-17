@@ -1,10 +1,18 @@
-name: QA agent
+name: NeatLogs diagnosis QA
 on:
   push:
   pull_request:
   schedule:
     - cron: '0 2 * * *'
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'command = configured NeatLogs runner; reference = standalone baseline only'
+        type: choice
+        options:
+          - command
+          - reference
+        default: command
 permissions:
   contents: read
 jobs:
@@ -16,7 +24,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m unittest -v
-  live-qa:
+  diagnosis-qa:
     concurrency:
       group: qa-regression-history
       cancel-in-progress: false
@@ -26,32 +34,30 @@ jobs:
     timeout-minutes: 30
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      NEATLOGS_API_KEY: ${{ secrets.NEATLOGS_API_KEY }}
+      NEATLOGS_ADAPTER_COMMAND: ${{ vars.NEATLOGS_ADAPTER_COMMAND }}
+      NEATLOGS_TARGET_ID: ${{ vars.NEATLOGS_TARGET_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Explain missing credentials
-        if: env.OPENAI_API_KEY == ''
-        run: echo 'Live QA skipped — configure the OPENAI_API_KEY Actions secret to enable the LLM run.' >> "$GITHUB_STEP_SUMMARY"
       - name: Restore regression memory
-        if: env.OPENAI_API_KEY != ''
         uses: actions/cache/restore@v4
         with:
           path: .qa/regressions.json
           key: qa-regression-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             qa-regression-${{ github.ref_name }}-
-      - name: Run QA agent
-        if: env.OPENAI_API_KEY != ''
-        run: python qa_agent.py --output reports
-      - name: Save regression memory even when bugs are found
-        if: always() && env.OPENAI_API_KEY != '' && hashFiles('.qa/regressions.json') != ''
+      - name: Run configured diagnosis QA
+        run: python scripts/run_ci.py
+      - name: Save regression memory
+        if: always() && hashFiles('.qa/regressions.json') != ''
         uses: actions/cache/save@v4
         with:
           path: .qa/regressions.json
           key: qa-regression-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Upload reports and traces
+      - name: Upload reports and history
         if: always()
         uses: actions/upload-artifact@v4
         with:
