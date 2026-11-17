@@ -37,6 +37,8 @@ jobs:
       NEATLOGS_API_KEY: ${{ secrets.NEATLOGS_API_KEY }}
       NEATLOGS_ADAPTER_COMMAND: ${{ vars.NEATLOGS_ADAPTER_COMMAND }}
       NEATLOGS_TARGET_ID: ${{ vars.NEATLOGS_TARGET_ID }}
+      QA_DATASET: ${{ vars.QA_DATASET }}
+      QA_VERIFIER_COMMAND: ${{ vars.QA_VERIFIER_COMMAND }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

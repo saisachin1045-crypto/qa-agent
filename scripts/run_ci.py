@@ -21,6 +21,10 @@ def main():
     args=[sys.executable,'qa_agent.py','--target',mode]
     if mode=='command':
         args+=['--adapter-command',os.environ['NEATLOGS_ADAPTER_COMMAND'],'--target-id',os.environ['NEATLOGS_TARGET_ID']]
+    if os.getenv('QA_DATASET'):
+        args+=['--dataset',os.environ['QA_DATASET'],'--benchmark']
+    if os.getenv('QA_VERIFIER_COMMAND'):
+        args+=['--verifier-command',os.environ['QA_VERIFIER_COMMAND']]
     with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
         f.write('## Diagnosis QA target\n'+('Reference LLM only; not NeatLogs.' if mode=='reference' else os.environ['NEATLOGS_TARGET_ID'])+'\n')
     return subprocess.call(args)

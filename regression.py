@@ -41,12 +41,14 @@ class RegressionStore:
     def remember(self,bug,scenario,contract,target):
         # Fixture kind/variant define deterministic semantics; random OTel IDs do not create new bugs.
         key='reg_'+fingerprint({'rule':bug['rule'],'kind':scenario['kind'],'variant':scenario['variant'],
+             'case_fingerprint':scenario.get('case_fingerprint'),
              'contract':contract,'target':target,'observation':bug['title'] if bug['rule']=='OBSERVATION' else None})
         if key not in self.cases:
             self.cases[key]={'id':key,'rule':bug['rule'],'scenario':copy.deepcopy(scenario),'contract':contract,
                 'target':target,'description':bug['description'],'title':bug['title'],'status':'open',
                 'history':[],'last_run':None,'source_trace_id':bug['trace_id'],'source_span_ids':bug['span_ids']}
         elif self.cases[key]['status']=='resolved': self.cases[key]['status']='reopened'
+        if bug.get('requires_fix_verification'): self.cases[key]['requires_fix_verification']=True
         return key
 
     def select(self,limit,target):
@@ -56,7 +58,9 @@ class RegressionStore:
     def outcome(self,key,checks,contract):
         case=self.cases[key]
         if case['contract']!=contract: return 'stale'
-        if not checks['completed']: return 'inconclusive'
+        if not checks['completed'] or checks.get('verification_inconclusive'): return 'inconclusive'
+        if case.get('requires_fix_verification') and checks.get('verification_status') not in {'verified_by_runner','failed'}:
+            return 'inconclusive'
         if case['rule']=='OBSERVATION': return 'needs_review'
         return 'failed' if any(v['rule']==case['rule'] for v in checks['violations']) else 'passed'
 

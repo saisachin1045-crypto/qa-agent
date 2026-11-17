@@ -137,3 +137,85 @@ Pushes and pull requests run offline tests. Nightly at 02:00 UTC (7:30 AM IST) a
 Without an adapter/key, the workflow explicitly reports the target run as skipped. Manual `reference` runs are separately labeled; nightly execution never silently substitutes a baseline for NeatLogs. Download `qa-reports` for outputs and history.
 
 Runs are serialized and history is restored/saved using a branch-scoped Actions cache, even on detected bugs. Caches and artifacts have retention limits: download history for a durable backup. Use `--history PATH` locally to restore it. Reference and real target cases are isolated by target identity.
+
+## Evaluate reviewed real traces
+
+The harness can now load cases exported from real telemetry rather than relying only on the built-in scenarios. Use [`examples/reviewed-traces.json`](examples/reviewed-traces.json) as a **synthetic format example**; replace the packet and expected results with independently reviewed evidence. The loader requires a reviewer and review reference, verifies span references, and keeps expected answers out of the target request.
+
+```sh
+# LLM planner explores reviewed case IDs and supported related variants:
+python qa_agent.py --target command --adapter-command '["python", "your_neatlogs_runner_adapter.py"]' --target-id neatlogs-staging --dataset reviewed-traces.json
+
+# Deterministically evaluate EVERY supplied case, not an LLM-selected subset:
+python qa_agent.py --target command --adapter-command '["python", "your_neatlogs_runner_adapter.py"]' --target-id neatlogs-staging --dataset reviewed-traces.json --benchmark
+```
+
+Benchmark mode uses bounded batches of at most 12 scenarios / 60 harness model turns each. A large corpus can run several batches and incur more total cost than one planner session. `reports/benchmark.json` aggregates results and lists any unattempted cases; per-batch reports contain evidence. The benchmark drives the target directly, checks every result, and files deterministic findings without needing an LLM planner. Reference mode still needs a model key for target calls.
+
+### Dataset format
+
+Each `cases` entry has:
+
+- `id`: unique identifier, separate from built-in fixture names.
+- `source`: `production` or `synthetic`; this is the dataset author's declaration, not a provenance audit.
+- `review`: `{ "by": "reviewer", "reference": "review record" }`.
+- `packet`: the exact target input described in [the adapter contract](docs/adapter-contract.md).
+- `expected`: `assessment`, `required_detections`, `allowed_detections`, `decisive_span_ids`, and `allowed_actions`. Allowed actions may include multiple reviewer-approved remedies. Span IDs must exist in the selected trace/session.
+
+Review labels must use the supported detection catalog. The harness validates consistency, not the human reviewer's correctness. For complex failures, use focused cases whose decisive witness spans are appropriate for each required detection. No expected labels, review metadata or oracle are sent to the target. Reviewed variants preserve evidence and labels while renaming workflows or adding untrusted log instructions; these derived cases are measured separately from unchanged production cases.
+
+## Measure quality, latency and usage
+
+Reports now calculate micro-averaged negative-detection precision/recall, TP/FP/FN counts, assessment accuracy, unique cases, attempted/completed/error counts, and median/p95 target-call latency. Synthetic, declared-production and derived samples are separate groups. Rates describe the executed reviewed sample, not all production traffic. Incomplete target calls are shown as execution failures and excluded from accuracy denominators; they still fail the run.
+
+Repeated attempts count as attempts; `unique_cases` exposes the underlying sample count. OpenAI-reported usage is recorded per harness model call, with unreported calls counted separately. Cost stays unknown because deployment billing and price configuration are not available. Latency includes adapter overhead, not only model inference time.
+
+## Verify a proposed fix with actual tests
+
+Configure a trusted verifier command to reproduce the failure and test the proposed candidate in your team's isolated environment:
+
+```sh
+python qa_agent.py --target command --adapter-command '["python", "your_neatlogs_runner_adapter.py"]' --target-id neatlogs-staging --verifier-command '["python", "your_sandbox_verifier.py"]'
+```
+
+The verifier receives `packet` and `diagnosis` as JSON on stdin. It must run its own baseline reproduction, candidate tests and regression suite in an isolated application checkout/container. The harness never executes model-generated patch text or commands itself. The team-specific verifier still needs to be connected to the application and its tests; a process adapter is not itself a sandbox.
+
+The verifier returns exactly:
+
+```json
+{
+  "baseline_failure_reproduced": true,
+  "candidate_tests_passed": true,
+  "regression_tests_passed": true,
+  "checks": [{"name": "timeout path reproduced and fixed", "passed": true}],
+  "sandbox_id": "isolated-run-123",
+  "artifact_refs": ["path-or-url-to-test-evidence"]
+}
+```
+
+`verified_by_runner` requires a reproduced baseline, passing candidate/regression tests, individually passing checks, and evidence references. Exit code zero alone is insufficient. A reproduced failure with failing candidate checks produces a P4 finding. A baseline that cannot be reproduced is `inconclusive`; missing/malformed output or timeouts are errors. Previously recorded fix-test failures cannot be marked resolved when the verifier is absent on a later run.
+
+Evidence assertions and artifact references come from the configured trusted runner; the harness does not independently authenticate them. Verification is not a claim that a fix was deployed. Without a verifier, reports say `not_configured`; the diagnosis-only run can still succeed. The verifier has a 120-second timeout.
+
+## Continuous processing of incoming reviewed cases
+
+`watch.py` polls a folder and evaluates newly delivered reviewed JSON datasets:
+
+```sh
+python watch.py --inbox incoming --target command --adapter-command '["python", "your_neatlogs_runner_adapter.py"]' --target-id neatlogs-staging --revision release-1
+```
+
+Have your export/review pipeline write a temporary file and atomically rename it to `*.json` after it is complete. The watcher checks every five seconds by default, runs cases sequentially, writes per-input reports, and saves deduplication state in `.qa/watch-state.json`. Use `--once` to drain current inputs and exit, or `--interval 10` to change polling. Add `--verifier-command` to enable fix verification.
+
+Use the same target ID across versions, and change `--revision` after a deployment to reevaluate unchanged inbox files. This preserves regression identity while enabling another watch pass. Failed/malformed items are recorded once rather than triggering repeated paid calls; fix the input or change the revision to retry. One watcher owns a state-file lock; after a hard crash, inspect and remove a stale `.lock` directory before restarting. A crash before state persistence may repeat a target call, so adapters should be idempotent.
+
+This is continuous processing of **reviewed incoming cases**, not an installed NeatLogs subscription or an always-on hosted service. Run it on your server/supervisor and connect the actual export/review pipeline. Unlabeled production telemetry cannot yield trustworthy accuracy metrics automatically. No continuous service is started by installing or pushing this repository.
+
+## Configure the new features in GitHub Actions
+
+Optional repository variables:
+
+- `QA_DATASET`: path to a reviewed dataset available in the checkout; enables full benchmark mode for nightly/manual runs.
+- `QA_VERIFIER_COMMAND`: JSON argv array for the team's trusted sandbox verifier.
+
+Sensitive real-trace datasets can be made available by a private setup step instead of committing them to a public repository. The existing target/key setup, cached regression memory and report artifacts still apply. Continuous watch mode runs on your own worker; GitHub Actions remains scheduled/on-demand.
